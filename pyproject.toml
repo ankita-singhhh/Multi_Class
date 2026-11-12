@@ -48,22 +48,6 @@ all = [
     "seaborn>=0.13",
 ]
 
-[tool.setuptools]
-py-modules = [
-    "ablation",
-    "backbone",
-    "benchmark",
-    "config",
-    "dataset",
-    "head",
-    "models",
-    "qvi",
-    "text_encoder",
-    "train",
-    "validation",
-    "yolocount",
-]
-
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["yolocount_mc*"]
