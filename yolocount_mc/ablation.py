@@ -1,53 +1,49 @@
 
 """
-Step 11: Controlled QVI ablation experiments.
+Controlled QVI ablation experiments for Multi-Class YOLO-Count.
 
 Variants:
-    B             : Multi-class YOLO-Count baseline
-    QVI-gated     : Model B + gated QVI
-    QVI-mod       : Model B + modulation QVI
+    B          : Multi-class YOLO-Count baseline
+    QVI-gated  : Model B + gated QVI
+    QVI-mod    : Model B + modulation QVI
 
 Protocol:
     - Real training and validation datasets only.
     - At least three independent random seeds.
-    - Each QVI variant starts from the same seed-specific
-      trained Model B initialization.
-    - Identical validation data and evaluation protocol.
-    - Report per-seed MAE/RMSE, mean and standard deviation.
-    - Save experiment results as JSON and CSV.
+    - One trained Model B per seed.
+    - Both QVI variants start from the same seed-specific Model B.
+    - Baseline weights are checked for unintended modification.
+    - Identical validation dataset and evaluation protocol.
+    - Per-seed MAE/RMSE and aggregate mean/sample standard deviation.
+    - Results saved as JSON and CSV.
 
-No toy datasets are used in this module.
+This module does not create toy datasets.
 """
 
 import csv
+import hashlib
 import json
 import random
 import statistics
 from pathlib import Path
 from dataclasses import replace
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, Optional, Sequence
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-try:
-    from .config import Config
-    from .train import train_model_B, train_model_C
-    from .dataset import collate
-except ImportError:
-    from config import Config
-    from train import train_model_B, train_model_C
-    from dataset import collate
+from .config import Config
+from .train import train_model_B, train_model_C
+from .dataset import collate
 
 
 # ---------------------------------------------------------
 # REPRODUCIBILITY
 # ---------------------------------------------------------
 
-def set_experiment_seed(seed: int):
-    """Set random seeds across Python, NumPy and PyTorch."""
-
+def set_experiment_seed(seed: int) -> None:
+    """Set Python, NumPy and PyTorch random seeds."""
     random.seed(seed)
     np.random.seed(seed)
 
@@ -56,6 +52,98 @@ def set_experiment_seed(seed: int):
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
+
+    # Improve repeatability of CUDA/cuDNN execution.
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
+def _model_state_digest(model) -> str:
+    """
+    Calculate a digest of model state without retaining a second
+    complete copy of its parameters in memory.
+    """
+    digest = hashlib.sha256()
+
+    for name, tensor in sorted(model.state_dict().items()):
+        digest.update(name.encode("utf-8"))
+
+        value = tensor.detach().contiguous().cpu()
+
+        # Byte view supports dtypes such as bfloat16.
+        digest.update(value.view(torch.uint8).numpy().tobytes())
+
+    return digest.hexdigest()
+
+
+def _assert_model_unchanged(model, original_digest: str) -> None:
+    """Raise if a QVI experiment unexpectedly modified Model B."""
+    current_digest = _model_state_digest(model)
+
+    if current_digest != original_digest:
+        raise RuntimeError(
+            "The baseline Model B weights changed during QVI training. "
+            "Check Model C initialization and parameter independence."
+        )
+
+
+# ---------------------------------------------------------
+# INPUT VALIDATION
+# ---------------------------------------------------------
+
+def _validate_seeds(seeds: Sequence[int]) -> tuple:
+    seeds = tuple(seeds)
+
+    if len(seeds) < 3:
+        raise ValueError(
+            "Research ablations require at least 3 independent seeds."
+        )
+
+    if any(
+        not isinstance(seed, int) or isinstance(seed, bool)
+        for seed in seeds
+    ):
+        raise TypeError("Every experiment seed must be an integer.")
+
+    if len(set(seeds)) != len(seeds):
+        raise ValueError("Experiment seeds must be unique.")
+
+    return seeds
+
+
+def _validate_positive_integer(name: str, value: int) -> None:
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer.")
+
+
+def _validate_experiment_inputs(
+    train_dataset,
+    val_dataset,
+    epochs: int,
+    batch_size: int,
+    learning_rate: float,
+    qvi_fine_tune_epochs: int,
+) -> None:
+    if train_dataset is None or val_dataset is None:
+        raise ValueError(
+            "Real training and validation datasets are required."
+        )
+
+    _validate_positive_integer("epochs", epochs)
+    _validate_positive_integer("batch_size", batch_size)
+
+    if (
+        not isinstance(qvi_fine_tune_epochs, int)
+        or isinstance(qvi_fine_tune_epochs, bool)
+        or qvi_fine_tune_epochs < 0
+    ):
+        raise ValueError(
+            "qvi_fine_tune_epochs must be a non-negative integer."
+        )
+
+    if not np.isfinite(learning_rate) or learning_rate <= 0:
+        raise ValueError("learning_rate must be positive and finite.")
 
 
 # ---------------------------------------------------------
@@ -70,30 +158,26 @@ def evaluate_counting(
     batch_size: Optional[int] = None,
 ) -> Dict[str, float]:
     """
-    Evaluate a trained counting model on a real dataset.
+    Evaluate a trained counting model.
 
-    Computes metrics only over valid, non-padded queries.
-
-    Returns:
-        MAE
-        RMSE
-        Number of evaluated class-image pairs
+    Metrics are calculated over valid, non-padded class-image pairs.
+    MAE and RMSE use the same pair-level aggregation.
     """
-
     model.eval()
 
-    batch_size = batch_size or getattr(cfg, "batch_size", 4)
+    if batch_size is None:
+        batch_size = getattr(cfg, "batch_size", 4)
+
+    _validate_positive_integer("batch_size", batch_size)
+
+    device = torch.device(cfg.device)
 
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=getattr(cfg, "num_workers", 0),
-        pin_memory=(
-            cfg.device.type == "cuda"
-            if isinstance(cfg.device, torch.device)
-            else str(cfg.device).startswith("cuda")
-        ),
+        pin_memory=(device.type == "cuda"),
         collate_fn=collate,
     )
 
@@ -102,13 +186,10 @@ def evaluate_counting(
     valid_count = 0
 
     for images, queries, targets, query_mask in loader:
-
-        images = images.to(cfg.device, non_blocking=True)
-        targets = targets.to(
-            cfg.device, non_blocking=True
-        )
+        images = images.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
         query_mask = query_mask.to(
-            cfg.device, non_blocking=True
+            device, non_blocking=True
         ).bool()
 
         predictions, _, _ = model(images, queries)
@@ -116,25 +197,38 @@ def evaluate_counting(
         if predictions.shape != targets.shape:
             raise ValueError(
                 "Prediction and target shapes differ: "
-                f"{predictions.shape} vs {targets.shape}"
+                f"{tuple(predictions.shape)} vs "
+                f"{tuple(targets.shape)}"
             )
 
-        errors = predictions.float() - targets.float()
+        if query_mask.shape != targets.shape:
+            raise ValueError(
+                "Query mask and target shapes differ: "
+                f"{tuple(query_mask.shape)} vs "
+                f"{tuple(targets.shape)}"
+            )
 
-        valid_errors = errors[query_mask]
+        valid_predictions = predictions.float()[query_mask]
+        valid_targets = targets.float()[query_mask]
 
-        if valid_errors.numel() == 0:
+        if valid_predictions.numel() == 0:
             continue
 
-        absolute_error_sum += (
-            valid_errors.abs().sum().item()
-        )
+        if not torch.isfinite(valid_predictions).all():
+            raise ValueError(
+                "Model produced NaN or infinite valid predictions."
+            )
 
-        squared_error_sum += (
-            valid_errors.square().sum().item()
-        )
+        if not torch.isfinite(valid_targets).all():
+            raise ValueError(
+                "Validation dataset contains NaN or infinite valid targets."
+            )
 
-        valid_count += valid_errors.numel()
+        errors = valid_predictions - valid_targets
+
+        absolute_error_sum += errors.abs().sum().item()
+        squared_error_sum += errors.square().sum().item()
+        valid_count += errors.numel()
 
     if valid_count == 0:
         raise RuntimeError(
@@ -156,30 +250,33 @@ def evaluate_counting(
 # ---------------------------------------------------------
 
 def summarize_results(
-    results: Dict[str, List[Dict]],
+    results: Dict[str, list],
 ) -> Dict[str, Dict]:
-    """
-    Calculate mean and sample standard deviation
-    across independent random seeds.
-    """
-
+    """Calculate mean and sample standard deviation across seeds."""
     summary = {}
 
     for variant, runs in results.items():
+        if not runs:
+            raise ValueError(
+                f"No experiment results found for variant {variant}."
+            )
 
-        maes = [run["mae"] for run in runs]
-        rmses = [run["rmse"] for run in runs]
+        maes = [float(run["mae"]) for run in runs]
+        rmses = [float(run["rmse"]) for run in runs]
+
+        if not all(np.isfinite(value) for value in maes + rmses):
+            raise ValueError(
+                f"Non-finite metrics found for variant {variant}."
+            )
 
         summary[variant] = {
-            "mae_mean": statistics.mean(maes),
-            "mae_std": (
-                statistics.stdev(maes)
-                if len(maes) > 1 else 0.0
+            "mae_mean": float(statistics.mean(maes)),
+            "mae_std": float(
+                statistics.stdev(maes) if len(maes) > 1 else 0.0
             ),
-            "rmse_mean": statistics.mean(rmses),
-            "rmse_std": (
-                statistics.stdev(rmses)
-                if len(rmses) > 1 else 0.0
+            "rmse_mean": float(statistics.mean(rmses)),
+            "rmse_std": float(
+                statistics.stdev(rmses) if len(rmses) > 1 else 0.0
             ),
             "num_seeds": len(runs),
         }
@@ -192,17 +289,17 @@ def summarize_results(
 # ---------------------------------------------------------
 
 def save_ablation_results(
-    results: Dict[str, List[Dict]],
+    results: Dict[str, list],
     summary: Dict[str, Dict],
     output_dir,
-):
-    """Save detailed and aggregated results."""
-
+    metadata: Optional[Dict] = None,
+) -> Dict[str, str]:
+    """Save per-seed results, aggregate results and metadata."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Detailed JSON
     payload = {
+        "metadata": metadata or {},
         "per_seed_results": results,
         "summary": summary,
     }
@@ -210,57 +307,45 @@ def save_ablation_results(
     json_path = output_dir / "ablation_results.json"
 
     with open(json_path, "w", encoding="utf-8") as file:
-        json.dump(payload, file, indent=4)
+        json.dump(payload, file, indent=4, allow_nan=False)
 
-    # Detailed CSV
     csv_path = output_dir / "ablation_results.csv"
 
     with open(csv_path, "w", newline="", encoding="utf-8") as file:
+        fieldnames = [
+            "variant",
+            "seed",
+            "mae",
+            "rmse",
+            "num_evaluated",
+        ]
 
-        writer = csv.DictWriter(
-            file,
-            fieldnames=[
-                "variant",
-                "seed",
-                "mae",
-                "rmse",
-                "num_evaluated",
-            ],
-        )
-
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
         writer.writeheader()
 
         for variant, runs in results.items():
             for run in runs:
-
                 writer.writerow({
                     "variant": variant,
                     **run,
                 })
 
-    # Summary CSV
     summary_path = output_dir / "ablation_summary.csv"
 
-    with open(
-        summary_path, "w", newline="", encoding="utf-8"
-    ) as file:
+    with open(summary_path, "w", newline="", encoding="utf-8") as file:
+        fieldnames = [
+            "variant",
+            "mae_mean",
+            "mae_std",
+            "rmse_mean",
+            "rmse_std",
+            "num_seeds",
+        ]
 
-        writer = csv.DictWriter(
-            file,
-            fieldnames=[
-                "variant",
-                "mae_mean",
-                "mae_std",
-                "rmse_mean",
-                "rmse_std",
-                "num_seeds",
-            ],
-        )
-
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
         writer.writeheader()
 
         for variant, metrics in summary.items():
-
             writer.writerow({
                 "variant": variant,
                 **metrics,
@@ -288,63 +373,51 @@ def run_ablation(
     qvi_fine_tune_epochs: int = 0,
 ):
     """
-    Run controlled Model B vs QVI ablations.
+    Run controlled Model B vs QVI ablation experiments.
+
+    Each seed trains one baseline Model B. Both QVI variants
+    are initialized independently from that same baseline.
 
     Args:
-        train_dataset:
-            Actual training dataset, e.g. COCO or LVIS.
-
-        val_dataset:
-            Actual validation dataset.
-
-        seeds:
-            Independent random seeds. Use at least 3.
-
-        cfg:
-            Project configuration.
-
-        epochs:
-            Number of Model B training epochs.
-
-        batch_size:
-            Training batch size.
-
-        learning_rate:
-            Learning rate.
-
-        qvi_fine_tune_epochs:
-            Optional fine-tuning epochs after QVI-only training.
+        train_dataset: Real training dataset.
+        val_dataset: Real validation dataset.
+        seeds: At least three distinct integer seeds.
+        cfg: Project configuration.
+        epochs: Model B and QVI-only training epochs.
+        batch_size: Training and validation batch size.
+        learning_rate: Learning rate.
+        qvi_fine_tune_epochs: Optional QVI fine-tuning epochs.
 
     Returns:
-        Per-seed results and aggregate statistics.
+        Per-seed results, aggregate statistics and saved file paths.
     """
-
     if cfg is None:
         cfg = Config()
 
-    seeds = tuple(seeds)
+    seeds = _validate_seeds(seeds)
 
-    if len(seeds) < 3:
-        raise ValueError(
-            "Research ablations require at least 3 independent seeds."
-        )
-
-    if len(set(seeds)) != len(seeds):
-        raise ValueError("Experiment seeds must be unique.")
-
-    if train_dataset is None or val_dataset is None:
-        raise ValueError(
-            "Real training and validation datasets are required."
-        )
-
-    epochs = epochs or getattr(cfg, "epochs", 20)
-
-    batch_size = batch_size or getattr(
-        cfg, "batch_size", 4
+    epochs = (
+        getattr(cfg, "epochs", 20)
+        if epochs is None else epochs
     )
 
-    learning_rate = learning_rate or getattr(
-        cfg, "lr", 1e-4
+    batch_size = (
+        getattr(cfg, "batch_size", 4)
+        if batch_size is None else batch_size
+    )
+
+    learning_rate = (
+        getattr(cfg, "lr", 1e-4)
+        if learning_rate is None else learning_rate
+    )
+
+    _validate_experiment_inputs(
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
+        epochs=epochs,
+        batch_size=batch_size,
+        learning_rate=learning_rate,
+        qvi_fine_tune_epochs=qvi_fine_tune_epochs,
     )
 
     variants = {
@@ -356,7 +429,6 @@ def run_ablation(
     print("\n" + "=" * 75)
     print("YOLO-COUNT CONTROLLED ABLATION EXPERIMENT")
     print("=" * 75)
-
     print(f"Seeds: {seeds}")
     print(f"Model B epochs: {epochs}")
     print(f"Batch size: {batch_size}")
@@ -364,18 +436,12 @@ def run_ablation(
     print(f"QVI fine-tuning epochs: {qvi_fine_tune_epochs}")
     print("=" * 75)
 
-    # -----------------------------------------------------
-    # RUN EACH INDEPENDENT SEED
-    # -----------------------------------------------------
-
     for seed in seeds:
-
         print(f"\n\n{'#' * 65}")
         print(f"EXPERIMENT SEED: {seed}")
         print(f"{'#' * 65}")
 
         set_experiment_seed(seed)
-
         seed_cfg = replace(cfg, seed=seed)
 
         # -------------------------------------------------
@@ -417,22 +483,23 @@ def run_ablation(
             f"| RMSE: {baseline_metrics['rmse']:.4f}"
         )
 
+        # Save a digest to verify that Model B is not modified.
+        baseline_digest = _model_state_digest(model_B)
+
         # -------------------------------------------------
-        # 2. TRAIN QVI VARIANTS FROM THE SAME MODEL B
+        # 2. TRAIN BOTH QVI VARIANTS FROM THE SAME MODEL B
         # -------------------------------------------------
 
         for mode, variant_name in (
             ("gated", "QVI-gated"),
             ("modulation", "QVI-mod"),
         ):
-
             print(
                 f"\nTraining {variant_name} "
                 f"from seed {seed} Model B..."
             )
 
-            # Reinitialize RNG before each variant.
-            # This makes the experimental setup reproducible.
+            # Reset RNG so the variant setup is reproducible.
             set_experiment_seed(seed)
 
             qvi_cfg = replace(
@@ -456,6 +523,9 @@ def run_ablation(
                 raise RuntimeError(
                     f"train_model_C returned None for {variant_name}."
                 )
+
+            # Confirm that QVI training did not alter the baseline.
+            _assert_model_unchanged(model_B, baseline_digest)
 
             model_C.eval()
 
@@ -508,7 +578,6 @@ def run_ablation(
     print("-" * 85)
 
     for variant, metrics in summary.items():
-
         print(
             f"{variant:<16}"
             f"{metrics['mae_mean']:>14.4f}"
@@ -528,9 +597,7 @@ def run_ablation(
     print("\nQVI comparison against Model B:")
 
     for variant in ("QVI-gated", "QVI-mod"):
-
         qvi_mae = summary[variant]["mae_mean"]
-
         improvement = baseline_mae - qvi_mae
 
         improvement_percent = (
@@ -548,14 +615,24 @@ def run_ablation(
     # SAVE
     # -----------------------------------------------------
 
-    output_dir = (
-        Path(cfg.output_dir) / "ablation"
-    )
+    output_dir = Path(cfg.output_dir) / "ablation"
+
+    metadata = {
+        "seeds": list(seeds),
+        "epochs": epochs,
+        "batch_size": batch_size,
+        "learning_rate": learning_rate,
+        "qvi_fine_tune_epochs": qvi_fine_tune_epochs,
+        "validation_metric": "class-image-pair MAE and RMSE",
+        "standard_deviation": "sample standard deviation",
+        "variants": ["B", "QVI-gated", "QVI-mod"],
+    }
 
     saved_files = save_ablation_results(
         variants,
         summary,
         output_dir,
+        metadata=metadata,
     )
 
     print("\nSaved experiment results:")
@@ -567,4 +644,5 @@ def run_ablation(
         "per_seed_results": variants,
         "summary": summary,
         "saved_files": saved_files,
+        "metadata": metadata,
     }
