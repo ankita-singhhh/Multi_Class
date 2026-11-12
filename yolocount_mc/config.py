@@ -151,7 +151,9 @@ class Config:
     def __post_init__(self):
         """Validate configuration and prepare output directories."""
 
-        # Normalize paths.
+        # -----------------------------------------------------
+        # NORMALIZE PATHS
+        # -----------------------------------------------------
         path_fields = (
             "project_root",
             "dataset_root",
@@ -165,28 +167,45 @@ class Config:
         for name in path_fields:
             setattr(self, name, Path(getattr(self, name)))
 
-        # Basic model validation.
-        if self.img_size <= 0:
-            raise ValueError("img_size must be positive.")
+        # -----------------------------------------------------
+        # MODEL VALIDATION
+        # -----------------------------------------------------
+        for name in (
+            "img_size",
+            "backbone_channels",
+            "embed_dim",
+            "num_classes",
+        ):
+            value = getattr(self, name)
 
-        if self.backbone_channels <= 0:
-            raise ValueError("backbone_channels must be positive.")
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value <= 0
+            ):
+                raise ValueError(f"{name} must be a positive integer.")
 
-        if self.embed_dim <= 0:
-            raise ValueError("embed_dim must be positive.")
+        self.feature_strides = tuple(self.feature_strides)
 
-        if self.num_classes <= 0:
-            raise ValueError("num_classes must be positive.")
+        if not self.feature_strides:
+            raise ValueError("feature_strides cannot be empty.")
 
-        if any(stride <= 0 for stride in self.feature_strides):
-            raise ValueError("All feature strides must be positive.")
+        if any(
+            not isinstance(stride, int)
+            or isinstance(stride, bool)
+            or stride <= 0
+            for stride in self.feature_strides
+        ):
+            raise ValueError(
+                "All feature strides must be positive integers."
+            )
 
-        # QVI validation.
-        supported_qvi_modes = {
-            "none",
-            "gated",
-            "modulation",
-        }
+        # -----------------------------------------------------
+        # QVI VALIDATION
+        # -----------------------------------------------------
+        supported_qvi_modes = {"none", "gated", "modulation"}
+
+        self.qvi_type = str(self.qvi_type).lower()
 
         if self.qvi_type not in supported_qvi_modes:
             raise ValueError(
@@ -200,66 +219,114 @@ class Config:
                 "or qvi_type='modulation'."
             )
 
-        if self.qvi_channels <= 0:
-            raise ValueError("qvi_channels must be positive.")
+        if (
+            not isinstance(self.qvi_channels, int)
+            or isinstance(self.qvi_channels, bool)
+            or self.qvi_channels <= 0
+        ):
+            raise ValueError("qvi_channels must be a positive integer.")
 
-        if not 0.0 <= self.qvi_dropout < 1.0:
+        if (
+            not np.isfinite(self.qvi_dropout)
+            or not 0.0 <= self.qvi_dropout < 1.0
+        ):
             raise ValueError("qvi_dropout must be in [0, 1).")
 
-        # Dataset validation.
-        self.dataset_name = self.dataset_name.lower()
+        # -----------------------------------------------------
+        # DATASET VALIDATION
+        # -----------------------------------------------------
+        self.dataset_name = str(self.dataset_name).lower()
 
         if self.dataset_name not in {"coco", "lvis", "fsc147"}:
             raise ValueError(
                 f"Unsupported dataset: {self.dataset_name}."
             )
 
-        # Training validation.
-        if self.epochs <= 0:
-            raise ValueError("epochs must be positive.")
+        # -----------------------------------------------------
+        # TRAINING VALIDATION
+        # -----------------------------------------------------
+        for name in ("epochs", "batch_size"):
+            value = getattr(self, name)
 
-        if self.batch_size <= 0:
-            raise ValueError("batch_size must be positive.")
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value <= 0
+            ):
+                raise ValueError(f"{name} must be a positive integer.")
 
-        if self.num_workers < 0:
-            raise ValueError("num_workers cannot be negative.")
+        if (
+            not isinstance(self.num_workers, int)
+            or isinstance(self.num_workers, bool)
+            or self.num_workers < 0
+        ):
+            raise ValueError("num_workers must be a non-negative integer.")
 
-        if self.learning_rate <= 0 or self.backbone_lr <= 0:
-            raise ValueError("Learning rates must be positive.")
+        for name in ("learning_rate", "backbone_lr"):
+            value = getattr(self, name)
 
-        if self.weight_decay < 0:
-            raise ValueError("weight_decay cannot be negative.")
+            if not np.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be positive and finite.")
 
-        if self.warmup_epochs < 0:
-            raise ValueError("warmup_epochs cannot be negative.")
+        if (
+            not np.isfinite(self.weight_decay)
+            or self.weight_decay < 0
+        ):
+            raise ValueError("weight_decay must be finite and non-negative.")
 
-        if self.gradient_clip_norm <= 0:
-            raise ValueError("gradient_clip_norm must be positive.")
+        if (
+            not isinstance(self.warmup_epochs, int)
+            or isinstance(self.warmup_epochs, bool)
+            or self.warmup_epochs < 0
+        ):
+            raise ValueError("warmup_epochs must be non-negative.")
 
-        if self.optimizer.lower() not in {"adamw", "adam", "sgd"}:
+        if (
+            not np.isfinite(self.gradient_clip_norm)
+            or self.gradient_clip_norm <= 0
+        ):
+            raise ValueError(
+                "gradient_clip_norm must be positive and finite."
+            )
+
+        self.optimizer = str(self.optimizer).lower()
+        self.scheduler = str(self.scheduler).lower()
+
+        if self.optimizer not in {"adamw", "adam", "sgd"}:
             raise ValueError(
                 "optimizer must be adamw, adam or sgd."
             )
 
-        if self.scheduler.lower() not in {"cosine", "none"}:
+        if self.scheduler not in {"cosine", "none"}:
             raise ValueError(
                 "scheduler must be cosine or none."
             )
 
-        # Loss validation.
+        # -----------------------------------------------------
+        # LOSS VALIDATION
+        # -----------------------------------------------------
         loss_weights = (
             self.count_loss_weight,
             self.density_loss_weight,
             self.classification_loss_weight,
         )
 
-        if any(weight < 0 for weight in loss_weights):
-            raise ValueError("Loss weights cannot be negative.")
+        if any(
+            not np.isfinite(weight) or weight < 0
+            for weight in loss_weights
+        ):
+            raise ValueError(
+                "Loss weights must be finite and non-negative."
+            )
 
         if not any(weight > 0 for weight in loss_weights):
-            raise ValueError("At least one loss weight must be positive.")
+            raise ValueError(
+                "At least one loss weight must be positive."
+            )
 
-        # Device validation.
+        # -----------------------------------------------------
+        # DEVICE VALIDATION
+        # -----------------------------------------------------
         self.device = torch.device(self.device)
 
         if self.device.type == "cuda":
@@ -281,41 +348,97 @@ class Config:
                 f"Unsupported device type: {self.device.type}."
             )
 
-        if self.device.type == "mps" and not torch.backends.mps.is_available():
+        if (
+            self.device.type == "mps"
+            and not torch.backends.mps.is_available()
+        ):
             raise RuntimeError("MPS was requested but is unavailable.")
 
-        # Mixed precision validation.
+        # -----------------------------------------------------
+        # MIXED PRECISION VALIDATION
+        # -----------------------------------------------------
+        self.amp_dtype = str(self.amp_dtype).lower()
+
         if self.amp_dtype not in {"float16", "bfloat16"}:
             raise ValueError(
                 "amp_dtype must be float16 or bfloat16."
             )
 
-        self.use_amp = bool(
-            self.use_amp and self.device.type == "cuda"
-        )
+        if not isinstance(self.use_amp, bool):
+            raise TypeError("use_amp must be a boolean.")
 
-        # Checkpoint and validation configuration.
-        if self.validate_every <= 0:
-            raise ValueError("validate_every must be positive.")
+        self.use_amp = self.use_amp and self.device.type == "cuda"
 
-        if self.save_every <= 0:
-            raise ValueError("save_every must be positive.")
-
-        if self.early_stopping_patience < 0:
-            raise ValueError(
-                "early_stopping_patience cannot be negative."
+        if (
+            self.use_amp
+            and self.amp_dtype == "bfloat16"
+            and not torch.cuda.is_bf16_supported()
+        ):
+            raise RuntimeError(
+                "bfloat16 AMP was requested, but this CUDA GPU "
+                "does not report bfloat16 support. Use float16 instead."
             )
 
-        if self.log_interval <= 0:
-            raise ValueError("log_interval must be positive.")
+        # -----------------------------------------------------
+        # CHECKPOINT / VALIDATION CONFIGURATION
+        # -----------------------------------------------------
+        for name in ("validate_every", "save_every", "log_interval"):
+            value = getattr(self, name)
 
-        # Create output folders.
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value <= 0
+            ):
+                raise ValueError(f"{name} must be a positive integer.")
+
+        if (
+            not isinstance(self.early_stopping_patience, int)
+            or isinstance(self.early_stopping_patience, bool)
+            or self.early_stopping_patience < 0
+        ):
+            raise ValueError(
+                "early_stopping_patience must be non-negative."
+            )
+
+        if not isinstance(self.seed, int) or isinstance(self.seed, bool):
+            raise TypeError("seed must be an integer.")
+
+        if not isinstance(self.deterministic, bool):
+            raise TypeError("deterministic must be a boolean.")
+
+        if not isinstance(self.pin_memory, bool):
+            raise TypeError("pin_memory must be a boolean.")
+
+        if not isinstance(self.use_qvi, bool):
+            raise TypeError("use_qvi must be a boolean.")
+
+        if not isinstance(self.freeze_text_encoder, bool):
+            raise TypeError("freeze_text_encoder must be a boolean.")
+
+        if not isinstance(self.pretrained_backbone, bool):
+            raise TypeError("pretrained_backbone must be a boolean.")
+
+        if not isinstance(self.resume_training, bool):
+            raise TypeError("resume_training must be a boolean.")
+
+        # -----------------------------------------------------
+        # CREATE OUTPUT FOLDERS
+        # -----------------------------------------------------
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+    @property
+    def lr(self) -> float:
+        """
+        Backward-compatible alias for learning_rate.
+
+        Prefer using learning_rate in new code.
+        """
+        return self.learning_rate
+
     def set_seed(self):
         """Set random seeds for reproducible experiments."""
-
         random.seed(self.seed)
         np.random.seed(self.seed)
         torch.manual_seed(self.seed)
@@ -326,14 +449,12 @@ class Config:
         if self.deterministic:
             torch.backends.cudnn.deterministic = True
             torch.backends.cudnn.benchmark = False
-
         else:
             torch.backends.cudnn.deterministic = False
             torch.backends.cudnn.benchmark = True
 
     def get_amp_dtype(self):
         """Return the configured automatic mixed precision dtype."""
-
         if self.amp_dtype == "bfloat16":
             return torch.bfloat16
 
@@ -341,7 +462,6 @@ class Config:
 
     def summary(self):
         """Print the active experiment configuration."""
-
         print("\n========== YOLO-COUNT CONFIGURATION ==========")
         print(f"Project root     : {self.project_root}")
         print(f"Dataset          : {self.dataset_name}")
@@ -355,8 +475,10 @@ class Config:
         print(f"Batch size       : {self.batch_size}")
         print(f"Epochs           : {self.epochs}")
         print(f"Learning rate    : {self.learning_rate}")
+        print(f"Backbone LR      : {self.backbone_lr}")
         print(f"AMP enabled      : {self.use_amp}")
         print(f"AMP dtype        : {self.amp_dtype}")
         print(f"QVI enabled      : {self.use_qvi}")
         print(f"QVI type         : {self.qvi_type}")
+        print(f"Deterministic    : {self.deterministic}")
         print("==============================================\n")

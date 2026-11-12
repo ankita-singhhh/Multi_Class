@@ -407,7 +407,7 @@ def run_ablation(
     )
 
     learning_rate = (
-        getattr(cfg, "lr", 1e-4)
+        getattr(cfg, "learning_rate", 1e-4)
         if learning_rate is None else learning_rate
     )
 
