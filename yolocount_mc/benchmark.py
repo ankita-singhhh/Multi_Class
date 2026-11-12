@@ -13,15 +13,18 @@ Metrics:
     - P95 inference latency (ms)
     - Image throughput (images/second)
     - Query throughput (queries/second)
-    - Peak GPU memory (MB)
+    - Peak total GPU memory (MB)
+    - Incremental peak GPU memory (MB)
+    - Reserved GPU memory (MB)
 
 Important:
-    Pass trained models and real class names.
+    Pass trained models, real class names and a representative image.
     This module does not initialize or train models.
+    Input transfer is excluded from latency measurements.
 """
 
 import time
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, Optional, Sequence
 
 import numpy as np
 import torch
@@ -30,51 +33,109 @@ import torch
 DEFAULT_QUERY_COUNTS = (1, 2, 5, 10, 20)
 
 
-def _synchronize(device):
-    """Synchronize CUDA before and after timing."""
-
+def _synchronize(device: torch.device) -> None:
+    """Synchronize CUDA operations before or after timing."""
     if device.type == "cuda":
         torch.cuda.synchronize(device)
 
 
+def _validate_class_names(class_names: Sequence[str]) -> None:
+    if not class_names:
+        raise ValueError("class_names cannot be empty.")
+
+    if any(not isinstance(name, str) or not name.strip()
+           for name in class_names):
+        raise ValueError("Every class name must be a non-empty string.")
+
+    if len(set(name.strip() for name in class_names)) != len(class_names):
+        raise ValueError("Benchmark class names must be unique.")
+
+
 def _prepare_queries(class_names: Sequence[str], k: int):
-    """Prepare a single-image batch containing K distinct queries."""
+    """Prepare one image batch containing K distinct class queries."""
+    if not isinstance(k, int) or isinstance(k, bool) or k <= 0:
+        raise ValueError("K must be a positive integer.")
 
     if k > len(class_names):
         raise ValueError(
-            f"Requested K={k}, but only "
-            f"{len(class_names)} class names were supplied."
+            f"Requested K={k}, but only {len(class_names)} "
+            "class names were supplied."
         )
 
-    selected = list(class_names[:k])
+    return [list(class_names[:k])]
 
-    if len(set(selected)) != len(selected):
-        raise ValueError("Benchmark class names must be unique.")
 
-    return [selected]
+def _validate_image(image: torch.Tensor) -> None:
+    if not isinstance(image, torch.Tensor):
+        raise TypeError("image must be a torch.Tensor.")
+
+    if image.ndim != 4 or image.shape[0] != 1:
+        raise ValueError("Image must have shape [1, 3, H, W].")
+
+    if image.shape[1] != 3:
+        raise ValueError("Image must have 3 RGB channels.")
+
+    if image.shape[2] <= 0 or image.shape[3] <= 0:
+        raise ValueError("Image height and width must be positive.")
+
+    if not image.is_floating_point():
+        raise TypeError("Image tensor must have a floating-point dtype.")
+
+    if not torch.isfinite(image).all().item():
+        raise ValueError("Image contains NaN or infinite values.")
+
+
+def _validate_model_device(model, device: torch.device) -> None:
+    """Ensure model parameters and buffers are on the benchmark device."""
+    tensors = list(model.parameters()) + list(model.buffers())
+
+    if not tensors:
+        raise ValueError("Model has no parameters or buffers to validate.")
+
+    mismatched = [
+        tensor.device for tensor in tensors
+        if tensor.device != device
+    ]
+
+    if mismatched:
+        raise ValueError(
+            f"Model tensors must be on {device}; found {mismatched[0]}."
+        )
 
 
 def _run_model_a(model, image, queries):
     """
-    Model A requires one forward pass per query.
+    Model A executes one forward pass per query.
 
-    Returns the concatenated class counts.
+    Returns concatenated counts with shape [1, K].
     """
-
     predictions = []
 
     for query in queries[0]:
-        count, _, _ = model(image, [[query]])
-        predictions.append(count)
+        counts, _, _ = model(image, [[query]])
+        predictions.append(counts)
 
     return torch.cat(predictions, dim=1)
 
 
 def _run_model_b_or_c(model, image, queries):
-    """Models B and C process all queries in one forward pass."""
-
+    """Models B and C process all K queries in one forward pass."""
     counts, _, _ = model(image, queries)
     return counts
+
+
+def _validate_counts(counts: torch.Tensor, k: int) -> None:
+    if not isinstance(counts, torch.Tensor):
+        raise TypeError("Model must return counts as a torch.Tensor.")
+
+    if counts.shape != (1, k):
+        raise ValueError(
+            f"Expected count output shape [1, {k}], "
+            f"received {tuple(counts.shape)}."
+        )
+
+    if not torch.isfinite(counts).all().item():
+        raise ValueError("Model produced NaN or infinite counts.")
 
 
 @torch.inference_mode()
@@ -89,59 +150,44 @@ def benchmark_single(
     model_a: bool = False,
 ) -> Dict:
     """
-    Benchmark one model at a specified query count.
+    Benchmark one trained model at a specified query count.
 
-    Args:
-        model:
-            Already-trained model in evaluation mode.
-
-        image:
-            Real or representative image tensor [1,3,H,W].
-
-        class_names:
-            Distinct class names from the evaluation dataset.
-
-        k:
-            Number of class queries.
-
-        model_name:
-            Model identifier.
-
-        warmup:
-            Number of warm-up iterations.
-
-        iterations:
-            Number of timed iterations.
-
-        model_a:
-            Whether to execute K separate Model A passes.
+    The image must already be on the model's device.
+    Data transfer is excluded from the timing.
 
     Returns:
-        Dictionary containing latency, throughput and memory.
+        Dictionary containing latency, throughput and memory metrics.
     """
+    if not isinstance(warmup, int) or warmup < 0:
+        raise ValueError("warmup must be a non-negative integer.")
 
-    if warmup < 0 or iterations <= 0:
-        raise ValueError("Invalid warmup or iteration count.")
+    if not isinstance(iterations, int) or iterations <= 0:
+        raise ValueError("iterations must be a positive integer.")
+
+    _validate_class_names(class_names)
+    _validate_image(image)
 
     device = image.device
 
-    if image.ndim != 4 or image.shape[0] != 1:
-        raise ValueError("Benchmark image must have shape [1,3,H,W].")
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA image supplied but CUDA is unavailable.")
 
-    if image.shape[1] != 3:
-        raise ValueError("Benchmark image must have 3 RGB channels.")
-
-    if len(class_names) < k:
-        raise ValueError("Not enough class names for requested K.")
+    _validate_model_device(model, device)
 
     queries = _prepare_queries(class_names, k)
 
     model.eval()
 
     if model_a:
-        forward = lambda: _run_model_a(model, image, queries)
+        def forward():
+            counts = _run_model_a(model, image, queries)
+            _validate_counts(counts, k)
+            return counts
     else:
-        forward = lambda: _run_model_b_or_c(model, image, queries)
+        def forward():
+            counts = _run_model_b_or_c(model, image, queries)
+            _validate_counts(counts, k)
+            return counts
 
     # ---------------------------------------------------------
     # WARM-UP
@@ -152,10 +198,15 @@ def benchmark_single(
     _synchronize(device)
 
     # ---------------------------------------------------------
-    # RESET GPU MEMORY STATISTICS
+    # MEMORY BASELINE
     # ---------------------------------------------------------
     if device.type == "cuda":
+        baseline_allocated = torch.cuda.memory_allocated(device)
+
         torch.cuda.reset_peak_memory_stats(device)
+
+    else:
+        baseline_allocated = 0
 
     # ---------------------------------------------------------
     # LATENCY MEASUREMENT
@@ -163,7 +214,6 @@ def benchmark_single(
     latencies_ms = []
 
     for _ in range(iterations):
-
         _synchronize(device)
 
         start = time.perf_counter()
@@ -172,13 +222,10 @@ def benchmark_single(
 
         _synchronize(device)
 
-        elapsed_ms = (
-            time.perf_counter() - start
-        ) * 1000.0
-
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
         latencies_ms.append(elapsed_ms)
 
-    latency_array = np.asarray(latencies_ms)
+    latency_array = np.asarray(latencies_ms, dtype=np.float64)
 
     mean_latency = float(np.mean(latency_array))
     median_latency = float(np.median(latency_array))
@@ -188,41 +235,46 @@ def benchmark_single(
     # THROUGHPUT
     # ---------------------------------------------------------
     images_per_second = 1000.0 / mean_latency
-
-    queries_per_second = (
-        images_per_second * k
-    )
+    queries_per_second = (1000.0 * k) / mean_latency
 
     # ---------------------------------------------------------
     # GPU MEMORY
     # ---------------------------------------------------------
     if device.type == "cuda":
-
         _synchronize(device)
 
-        peak_memory_mb = (
-            torch.cuda.max_memory_allocated(device)
-            / (1024 ** 2)
-        )
+        peak_allocated = torch.cuda.max_memory_allocated(device)
+        peak_reserved = torch.cuda.max_memory_reserved(device)
 
-        reserved_memory_mb = (
-            torch.cuda.max_memory_reserved(device)
-            / (1024 ** 2)
-        )
+        peak_memory_mb = peak_allocated / (1024 ** 2)
+
+        incremental_peak_memory_mb = max(
+            0,
+            peak_allocated - baseline_allocated
+        ) / (1024 ** 2)
+
+        reserved_memory_mb = peak_reserved / (1024 ** 2)
 
     else:
         peak_memory_mb = float("nan")
+        incremental_peak_memory_mb = float("nan")
         reserved_memory_mb = float("nan")
 
     return {
         "model": model_name,
         "K": k,
+        "image_height": int(image.shape[2]),
+        "image_width": int(image.shape[3]),
+        "device": str(device),
+        "warmup": warmup,
+        "iterations": iterations,
         "mean_latency_ms": mean_latency,
         "median_latency_ms": median_latency,
         "p95_latency_ms": p95_latency,
         "images_per_second": images_per_second,
         "queries_per_second": queries_per_second,
         "peak_memory_mb": peak_memory_mb,
+        "incremental_peak_memory_mb": incremental_peak_memory_mb,
         "reserved_memory_mb": reserved_memory_mb,
     }
 
@@ -243,24 +295,37 @@ def benchmark(
     """
     Benchmark a trained model over multiple query counts.
 
-    Supply a representative image when possible. If image is
-    omitted, a zero-valued input is created for shape-only testing.
+    A real representative image is required. The img_size argument
+    is retained for API compatibility; image dimensions come from
+    the supplied image.
     """
-
-    device = torch.device(device)
-
     if image is None:
-        image = torch.zeros(
-            1, 3, img_size, img_size,
-            device=device,
+        raise ValueError(
+            "A real representative image is required. "
+            "Pass image=... instead of benchmarking a zero tensor."
         )
-    else:
-        image = image.to(device)
+
+    target_device = torch.device(device)
+
+    if target_device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but is unavailable.")
+
+    image = image.to(target_device)
+
+    _validate_image(image)
+    _validate_class_names(class_names)
+
+    Ks = list(Ks)
+
+    if not Ks:
+        raise ValueError("Ks cannot be empty.")
+
+    if len(set(Ks)) != len(Ks):
+        raise ValueError("Ks must not contain duplicate query counts.")
 
     rows = []
 
     for k in Ks:
-
         result = benchmark_single(
             model=model,
             image=image,
@@ -291,7 +356,10 @@ def benchmark_A_B_C(
     Compare already-trained Models A, B and C.
 
     All models must be loaded with trained weights.
+    The same image and class-name ordering are used for every model.
     """
+    _validate_image(image)
+    _validate_class_names(class_names)
 
     models = [
         ("A", model_A, True),
@@ -302,16 +370,13 @@ def benchmark_A_B_C(
     device = image.device
 
     print("\nYOLO-COUNT INFERENCE BENCHMARK")
-    print("=" * 105)
+    print("=" * 132)
 
     results = []
 
     for name, model, is_model_a in models:
-
         if model is None:
             continue
-
-        model.eval()
 
         rows = benchmark(
             model=model,
@@ -339,20 +404,18 @@ def benchmark_A_B_C(
         f"{'Images/s':>12}"
         f"{'Queries/s':>12}"
         f"{'Peak MB':>12}"
+        f"{'Extra MB':>12}"
     )
 
     print(header)
-    print("-" * 105)
+    print("-" * 132)
 
     for row in results:
+        peak = row["peak_memory_mb"]
+        extra = row["incremental_peak_memory_mb"]
 
-        memory = row["peak_memory_mb"]
-
-        memory_str = (
-            f"{memory:.1f}"
-            if np.isfinite(memory)
-            else "N/A"
-        )
+        peak_str = f"{peak:.1f}" if np.isfinite(peak) else "N/A"
+        extra_str = f"{extra:.1f}" if np.isfinite(extra) else "N/A"
 
         print(
             f"{row['model']:<8}"
@@ -362,9 +425,10 @@ def benchmark_A_B_C(
             f"{row['p95_latency_ms']:>11.2f}"
             f"{row['images_per_second']:>12.2f}"
             f"{row['queries_per_second']:>12.2f}"
-            f"{memory_str:>12}"
+            f"{peak_str:>12}"
+            f"{extra_str:>12}"
         )
 
-    print("=" * 105)
+    print("=" * 132)
 
     return results
