@@ -1,19 +1,79 @@
+
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "yolocount-mc-qvi"
-version = "0.1.0"
-description = "YOLO-Count multi-class extension (Model B) with optional Query-Visual Interaction (Model C)."
+version = "0.2.0"
+description = "Multi-class YOLO-Count with Query-Visual Interaction for research."
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
+
 dependencies = [
-    "torch>=2.0",
+    "torch>=2.2",
+    "torchvision>=0.17",
+    "numpy>=1.24",
+    "Pillow>=9.0",
+    "transformers>=4.40",
+    "ultralytics>=8.2",
+    "tqdm>=4.65",
+    "PyYAML>=6.0",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0"]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.5",
+]
+
+coco = [
+    "pycocotools>=2.0.7",
+]
+
+lvis = [
+    "lvis>=0.5.3",
+    "pycocotools>=2.0.7",
+]
+
+visualization = [
+    "matplotlib>=3.8",
+    "seaborn>=0.13",
+]
+
+all = [
+    "pycocotools>=2.0.7",
+    "lvis>=0.5.3",
+    "matplotlib>=3.8",
+    "seaborn>=0.13",
+]
+
+[tool.setuptools]
+py-modules = [
+    "ablation",
+    "backbone",
+    "benchmark",
+    "config",
+    "dataset",
+    "head",
+    "models",
+    "qvi",
+    "text_encoder",
+    "train",
+    "validation",
+    "yolocount",
+]
 
 [tool.setuptools.packages.find]
+where = ["."]
 include = ["yolocount_mc*"]
+namespaces = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"

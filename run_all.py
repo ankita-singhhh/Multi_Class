@@ -1,77 +1,312 @@
-"""End-to-end entry point: sanity tests -> train B -> train C -> benchmark."""
+
+"""
+YOLO-Count Multi-Class + QVI research entry point.
+
+This module provides:
+    1. Model shape checks.
+    2. Single-query vs multi-query consistency checks.
+    3. QVI zero-initialization checks.
+    4. Benchmark execution for trained models.
+    5. Real-dataset ablation execution.
+
+Training and evaluation are intentionally explicit.
+No toy datasets or random training data are used.
+"""
+
+from typing import Sequence
 
 import torch
 
 from yolocount_mc.config import Config
-from yolocount_mc.text_encoder import TextEncoder
-from yolocount_mc.models import ModelB, ModelC
-from yolocount_mc.dataset import VOCAB
-from yolocount_mc.train import train_model_B, train_model_C
+from yolocount_mc.models import ModelA, ModelB, ModelC
 from yolocount_mc.benchmark import benchmark_A_B_C
 from yolocount_mc.ablation import run_ablation
 
 
-def test_shapes(model, text_enc, cfg):
-    img = torch.randn(2, 3, cfg.img_size, cfg.img_size, device=cfg.device)
-    vocab_size = len(text_enc.vocab)
-    for K in (1, 2, 5, 20):
-        K = min(K, vocab_size)                       # cap at vocab size
-        qs = [list(text_enc.vocab.keys())[:K] for _ in range(2)]
-        counts, den, cls = model(img, qs)
-        assert counts.shape == (2, K)
-        assert den.shape[:2] == (2, K)
-        assert cls.shape[:2] == (2, K)
-    print("test_shapes: OK")
+# ---------------------------------------------------------
+# MODEL SHAPE CHECK
+# ---------------------------------------------------------
 
+@torch.inference_mode()
+def test_shapes(
+    model,
+    image: torch.Tensor,
+    class_names: Sequence[str],
+):
+    """Verify output dimensions for multiple query counts."""
 
-def test_consistency(model, text_enc, cfg, atol=1e-4):
     model.eval()
-    img = torch.randn(1, 3, cfg.img_size, cfg.img_size, device=cfg.device)
-    q = list(text_enc.vocab.keys())[:3]
-    with torch.no_grad():
-        out_K3, *_ = model(img, [q])
-        out_sep = torch.stack(
-            [model(img, [[qi]])[0][:, 0] for qi in q], dim=1,
+
+    if image.ndim != 4:
+        raise ValueError("Image must have shape [B,3,H,W].")
+
+    batch_size = image.shape[0]
+
+    for k in (1, 2, 5, 10, 20):
+
+        if k > len(class_names):
+            continue
+
+        queries = [
+            list(class_names[:k])
+            for _ in range(batch_size)
+        ]
+
+        counts, density, cls_logits = model(
+            image, queries
         )
-    assert torch.allclose(out_K3, out_sep, atol=atol)
-    print("test_consistency: OK")
+
+        assert counts.shape == (batch_size, k), (
+            f"Unexpected count shape: {counts.shape}"
+        )
+
+        assert density.shape[:2] == (
+            batch_size, k
+        )
+
+        assert cls_logits.shape[:2] == (
+            batch_size, k
+        )
+
+        assert torch.isfinite(counts).all()
+        assert torch.isfinite(density).all()
+        assert torch.isfinite(cls_logits).all()
+
+        assert (density >= 0).all(), (
+            "Density predictions must be nonnegative."
+        )
+
+    print("Model shape checks: PASSED")
 
 
-def test_qvi_zero_init(cfg):
-    enc = TextEncoder(VOCAB, d=cfg.embed_dim).to(cfg.device)
-    cfg_B = Config(**{**cfg.__dict__, "use_qvi": False})
-    cfg_C = Config(**{**cfg.__dict__, "use_qvi": True, "qvi_type": "modulation"})
-    B = ModelC(enc, cfg_B).to(cfg.device).eval()
-    C = ModelC(enc, cfg_C).to(cfg.device).eval()
-    C.load_state_dict(B.state_dict(), strict=False)
+# ---------------------------------------------------------
+# SINGLE QUERY VS MULTI-QUERY CONSISTENCY
+# ---------------------------------------------------------
 
-    img = torch.randn(1, 3, cfg.img_size, cfg.img_size, device=cfg.device)
-    q = [list(enc.vocab.keys())[:2]]
-    with torch.no_grad():
-        cB = B(img, q)[0]
-        cC = C(img, q)[0]
-    assert torch.allclose(cB, cC, atol=1e-5)
-    print("test_qvi_zero_init_equals_B: OK")
+@torch.inference_mode()
+def test_consistency(
+    model,
+    image: torch.Tensor,
+    class_names: Sequence[str],
+    atol: float = 1e-4,
+):
+    """
+    Check whether multi-query inference matches separate
+    single-query inference for the same model.
+
+    This check is meaningful when the model shares its
+    visual backbone across queries.
+    """
+
+    if len(class_names) < 2:
+        raise ValueError("At least two class names are required.")
+
+    model.eval()
+
+    queries = [list(class_names[:3])]
+
+    multi_counts, _, _ = model(image, queries)
+
+    separate_counts = []
+
+    for class_name in queries[0]:
+
+        count, _, _ = model(
+            image, [[class_name]]
+        )
+
+        separate_counts.append(count[:, 0])
+
+    separate_counts = torch.stack(
+        separate_counts,
+        dim=1,
+    )
+
+    if not torch.allclose(
+        multi_counts,
+        separate_counts,
+        atol=atol,
+        rtol=1e-4,
+    ):
+        max_error = (
+            multi_counts - separate_counts
+        ).abs().max().item()
+
+        raise AssertionError(
+            "Multi-query consistency failed. "
+            f"Maximum difference: {max_error:.6f}"
+        )
+
+    print("Multi-query consistency: PASSED")
 
 
-def main():
-    cfg = Config(img_size=128, backbone_channels=64, embed_dim=128, qvi_channels=16)
+# ---------------------------------------------------------
+# QVI ZERO INITIALIZATION
+# ---------------------------------------------------------
 
-    # 1. Sanity BEFORE training (minutes vs days of debugging).
-    enc = TextEncoder(VOCAB, d=cfg.embed_dim).to(cfg.device)
-    B_dry = ModelB(enc, cfg).to(cfg.device).eval()
-    test_shapes(B_dry, enc, cfg)
-    test_consistency(B_dry, enc, cfg)
-    test_qvi_zero_init(cfg)
+@torch.inference_mode()
+def test_qvi_zero_init(
+    model_B: ModelB,
+    model_C: ModelC,
+    image: torch.Tensor,
+    class_names: Sequence[str],
+    atol: float = 1e-5,
+):
+    """
+    Verify that a newly initialized zero-correction QVI
+    model reproduces Model B predictions.
 
-    # 2. Train B, then C (stage-wise).
-    B_trained = train_model_B(epochs=2, cfg=cfg)
-    _ = train_model_C(B_trained, epochs=2, cfg=cfg)
+    Model C must have been initialized from the exact
+    Model B weights, with zero-initialized QVI outputs.
+    """
 
-    # 3. Benchmark + ablation.
-    benchmark_A_B_C(cfg)
-    run_ablation(cfg=cfg)
+    if not class_names:
+        raise ValueError("At least one class name is required.")
+
+    model_B.eval()
+    model_C.eval()
+
+    queries = [list(class_names[:2])]
+
+    counts_B, _, _ = model_B(image, queries)
+    counts_C, _, _ = model_C(image, queries)
+
+    if not torch.allclose(
+        counts_B,
+        counts_C,
+        atol=atol,
+        rtol=1e-4,
+    ):
+        max_error = (
+            counts_B - counts_C
+        ).abs().max().item()
+
+        raise AssertionError(
+            "QVI zero-initialization check failed. "
+            f"Maximum difference: {max_error:.6f}"
+        )
+
+    print("QVI zero-initialization: PASSED")
+
+
+# ---------------------------------------------------------
+# RUN MODEL CHECKS
+# ---------------------------------------------------------
+
+def run_model_checks(
+    model_B,
+    model_C,
+    image,
+    class_names,
+):
+    """Run architecture checks on supplied models."""
+
+    test_shapes(
+        model_B,
+        image,
+        class_names,
+    )
+
+    test_consistency(
+        model_B,
+        image,
+        class_names,
+    )
+
+    test_qvi_zero_init(
+        model_B,
+        model_C,
+        image,
+        class_names,
+    )
+
+    return True
+
+
+# ---------------------------------------------------------
+# BENCHMARK TRAINED MODELS
+# ---------------------------------------------------------
+
+def run_benchmark(
+    model_A,
+    model_B,
+    model_C,
+    image,
+    class_names,
+    Ks=(1, 2, 5, 10, 20),
+    warmup=20,
+    iterations=100,
+):
+    """Benchmark three already-trained models."""
+
+    return benchmark_A_B_C(
+        model_A=model_A,
+        model_B=model_B,
+        model_C=model_C,
+        class_names=class_names,
+        image=image,
+        Ks=Ks,
+        warmup=warmup,
+        iterations=iterations,
+    )
+
+
+# ---------------------------------------------------------
+# RUN REAL-DATASET ABLATION
+# ---------------------------------------------------------
+
+def run_research_ablation(
+    train_dataset,
+    val_dataset,
+    cfg: Config,
+    seeds=(0, 1, 2),
+):
+    """Run the controlled QVI ablation experiment."""
+
+    return run_ablation(
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
+        cfg=cfg,
+        seeds=seeds,
+    )
+
+
+# ---------------------------------------------------------
+# ENVIRONMENT INFORMATION
+# ---------------------------------------------------------
+
+def print_environment():
+
+    print("\nYOLO-COUNT RESEARCH ENVIRONMENT")
+    print("-" * 45)
+
+    print("PyTorch:", torch.__version__)
+    print("CUDA available:", torch.cuda.is_available())
+
+    if torch.cuda.is_available():
+
+        print(
+            "GPU:",
+            torch.cuda.get_device_name(0),
+        )
+
+        print(
+            "CUDA version:",
+            torch.version.cuda,
+        )
+
+    else:
+        print("GPU: Not available")
+
+    print("-" * 45)
 
 
 if __name__ == "__main__":
-    main()
+
+    print_environment()
+
+    print(
+        "\nThis module provides research utilities."
+        "\nUse the GPU Jupyter notebook to supply real datasets,"
+        "\nload trained checkpoints and execute experiments."
+    )

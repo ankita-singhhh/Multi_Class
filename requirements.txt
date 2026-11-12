@@ -1,2 +1,33 @@
-torch>=2.0
-pytest>=7.0
+
+# Core deep learning
+torch>=2.2
+torchvision>=0.17
+numpy>=1.24
+
+# YOLO backbone
+ultralytics>=8.2
+
+# CLIP text encoder
+transformers>=4.40
+tokenizers>=0.19
+
+# Image processing
+Pillow>=9.0
+
+# Dataset utilities
+tqdm>=4.65
+PyYAML>=6.0
+
+# Testing and code quality
+pytest>=8.0
+ruff>=0.5
+
+# COCO dataset support
+pycocotools>=2.0.7
+
+# LVIS dataset support
+lvis>=0.5.3
+
+# Experiment visualization
+matplotlib>=3.8
+seaborn>=0.13

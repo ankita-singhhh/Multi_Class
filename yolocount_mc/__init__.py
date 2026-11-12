@@ -1,9 +1,10 @@
+
 """YOLO-Count Multi-Class + QVI package.
 
 Three models:
-    * Model A: original YOLO-Count   (one query per forward pass)
-    * Model B: multi-class extension (K classes in one pass, no QVI)
-    * Model C: Model B + QVI         (Query-Visual Interaction)
+    Model A: Original single-query YOLO-Count.
+    Model B: Multi-class counting without QVI.
+    Model C: Model B enhanced with QVI.
 """
 
 from .config import Config
