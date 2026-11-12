@@ -31,6 +31,9 @@ class ConvBNAct(nn.Module):
     ):
         super().__init__()
 
+        if in_channels <= 0 or out_channels <= 0:
+            raise ValueError("Channel dimensions must be positive.")
+
         self.block = nn.Sequential(
             nn.Conv2d(
                 in_channels,
@@ -80,19 +83,44 @@ class YoloBackbonePAFPN(nn.Module):
         if in_ch != 3:
             raise ValueError("YOLOv8 expects three RGB input channels.")
 
-        if out_ch <= 0:
-            raise ValueError("out_ch must be positive.")
+        if (
+            not isinstance(out_ch, int)
+            or isinstance(out_ch, bool)
+            or out_ch <= 0
+        ):
+            raise ValueError("out_ch must be a positive integer.")
+
+        if not isinstance(weights, str) or not weights.strip():
+            raise ValueError("weights must be a non-empty string.")
+
+        if not isinstance(pretrained, bool):
+            raise TypeError("pretrained must be a boolean.")
+
+        if not isinstance(freeze_backbone, bool):
+            raise TypeError("freeze_backbone must be a boolean.")
+
+        feature_indices = tuple(feature_indices)
 
         if len(feature_indices) != 3:
             raise ValueError(
                 "Exactly three feature indices are required: P3, P4, P5."
             )
 
-        if tuple(sorted(feature_indices)) != tuple(feature_indices):
+        if any(
+            not isinstance(index, int)
+            or isinstance(index, bool)
+            or index < 0
+            for index in feature_indices
+        ):
+            raise ValueError(
+                "Feature indices must be non-negative integers."
+            )
+
+        if tuple(sorted(feature_indices)) != feature_indices:
             raise ValueError("Feature indices must be in ascending order.")
 
-        if min(feature_indices) < 0:
-            raise ValueError("Feature indices cannot be negative.")
+        if len(set(feature_indices)) != 3:
+            raise ValueError("Feature indices must be unique.")
 
         try:
             from ultralytics import YOLO
@@ -104,34 +132,35 @@ class YoloBackbonePAFPN(nn.Module):
 
         model_source = weights
 
-        if not pretrained and weights.endswith(".pt"):
+        if not pretrained and weights.lower().endswith(".pt"):
             model_source = weights[:-3] + ".yaml"
 
         self.detector = YOLO(model_source)
         self.yolo_model = self.detector.model
 
-        # Use the official Ultralytics graph execution implementation.
-        if not hasattr(self.yolo_model, "_predict_once"):
+        if not hasattr(self.yolo_model, "model"):
             raise RuntimeError(
-                "This Ultralytics model does not expose _predict_once. "
-                "Check your Ultralytics version."
+                "Loaded Ultralytics model does not expose its layer graph."
             )
 
         self.layers = self.yolo_model.model
-        self.feature_indices = tuple(feature_indices)
+        self.feature_indices = feature_indices
 
-        if max(self.feature_indices) >= len(self.layers):
+        if max(feature_indices) >= len(self.layers):
             raise ValueError(
-                f"Invalid feature indices {self.feature_indices}. "
+                f"Invalid feature indices {feature_indices}. "
                 f"The loaded model contains {len(self.layers)} layers."
             )
 
-        # Validate feature taps using the actual loaded model graph.
+        if not hasattr(self.yolo_model, "save"):
+            raise RuntimeError(
+                "Loaded Ultralytics model does not expose graph save indices."
+            )
+
         self._validate_feature_taps()
 
-        # Obtain channel dimensions from a controlled dummy forward.
+        # Infer channels and verify P3/P4/P5 strides.
         feature_channels = self._infer_feature_channels()
-
         self.feature_channels = tuple(feature_channels)
 
         # -----------------------------------------------------
@@ -173,8 +202,8 @@ class YoloBackbonePAFPN(nn.Module):
         if self.freeze_backbone:
             self._freeze_yolo()
 
-    def _validate_feature_taps(self):
-        """Check that the selected layers are valid feature-producing layers."""
+    def _validate_feature_taps(self) -> None:
+        """Validate selected layers and their graph metadata."""
 
         for index in self.feature_indices:
             layer = self.layers[index]
@@ -184,74 +213,55 @@ class YoloBackbonePAFPN(nn.Module):
                     f"YOLO layer {index} is not a PyTorch module."
                 )
 
-    def _run_yolo(self, img: torch.Tensor):
-        """
-        Run the YOLO graph and capture selected intermediate features.
+            if not hasattr(layer, "f"):
+                raise RuntimeError(
+                    f"YOLO layer {index} does not expose graph routing "
+                    "metadata 'f'."
+                )
 
-        Ultralytics' _predict_once method handles its internal layer
-        routing and saved activation logic.
+            if not hasattr(layer, "i"):
+                raise RuntimeError(
+                    f"YOLO layer {index} does not expose layer index 'i'."
+                )
+
+    def _run_yolo(
+        self,
+        img: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Run the YOLO feature graph and capture selected feature maps.
+
+        This follows Ultralytics' layer routing semantics:
+        - module.f selects previous saved activations.
+        - module.save determines which outputs remain available.
+        - the Detect head is not executed.
         """
 
         captured = {}
-        original_forward = self.yolo_model._predict_once
+        saved_outputs = []
 
-        # The official implementation stores intermediate outputs
-        # in y. We capture the selected feature maps from this list.
-        def capture_forward(x, profile=False, visualize=False, embed=None):
-            y = []
-            embeddings = []
-
-            for module in self.yolo_model.model:
-                if module.f != -1:
-                    if isinstance(module.f, int):
-                        x = y[module.f]
-                    else:
-                        x = [
-                            x if j == -1 else y[j]
-                            for j in module.f
-                        ]
-
-                x = module(x)
-
-                y.append(
-                    x if module.i in self.yolo_model.save else None
-                )
-
-                if module.i in self.feature_indices:
-                    captured[module.i] = x
-
-            return x
-
-        # Execute the graph through the same module sequence and
-        # routing semantics as Ultralytics.
-        #
-        # This intentionally does not call the detector's Detect head.
-        x = img
-        y = []
-
-        for module in self.yolo_model.model:
-            if module.i > max(self.feature_indices):
+        for layer_index, module in enumerate(self.layers):
+            if layer_index > max(self.feature_indices):
                 break
 
             if module.f != -1:
                 if isinstance(module.f, int):
-                    x = y[module.f]
+                    img = saved_outputs[module.f]
                 else:
-                    x = [
-                        x if j == -1 else y[j]
-                        for j in module.f
+                    img = [
+                        img if source == -1 else saved_outputs[source]
+                        for source in module.f
                     ]
 
-            x = module(x)
+            img = module(img)
 
-            y.append(
-                x if module.i in self.yolo_model.save
-                or module.i in self.feature_indices
-                else None
+            # Preserve Ultralytics graph routing behavior.
+            saved_outputs.append(
+                img if module.i in self.yolo_model.save else None
             )
 
-            if module.i in self.feature_indices:
-                captured[module.i] = x
+            if layer_index in self.feature_indices:
+                captured[layer_index] = img
 
         if len(captured) != 3:
             raise RuntimeError(
@@ -263,42 +273,73 @@ class YoloBackbonePAFPN(nn.Module):
         )
 
     def _infer_feature_channels(self):
-        """Infer actual feature channels from a dummy forward pass."""
+        """
+        Infer feature channels from a dummy forward pass.
+
+        Also checks the expected P3/P4/P5 output strides using
+        a 256 x 256 input.
+        """
 
         was_training = self.yolo_model.training
         self.yolo_model.eval()
 
         try:
-            parameter = next(self.yolo_model.parameters())
-            device = parameter.device
-            dtype = parameter.dtype
+            try:
+                parameter = next(self.yolo_model.parameters())
+            except StopIteration as exc:
+                raise RuntimeError(
+                    "Loaded YOLO model has no parameters."
+                ) from exc
 
             dummy = torch.zeros(
-                1, 3, 256, 256,
-                device=device,
-                dtype=dtype,
+                1,
+                3,
+                256,
+                256,
+                device=parameter.device,
+                dtype=parameter.dtype,
             )
 
             with torch.no_grad():
                 features = self._run_yolo(dummy)
 
             channels = []
+            expected_sizes = ((32, 32), (16, 16), (8, 8))
 
-            for index, feature in zip(self.feature_indices, features):
+            for index, feature, expected_size in zip(
+                self.feature_indices,
+                features,
+                expected_sizes,
+            ):
                 if feature.ndim != 4:
                     raise RuntimeError(
-                        f"Feature layer {index} returned "
-                        f"shape {tuple(feature.shape)}."
+                        f"Feature layer {index} returned invalid shape "
+                        f"{tuple(feature.shape)}."
                     )
 
-                channels.append(feature.shape[1])
+                if feature.shape[0] != 1:
+                    raise RuntimeError(
+                        f"Feature layer {index} returned an invalid batch."
+                    )
+
+                actual_size = tuple(feature.shape[-2:])
+
+                if actual_size != expected_size:
+                    raise RuntimeError(
+                        f"Feature layer {index} produced spatial size "
+                        f"{actual_size}; expected {expected_size}. "
+                        "Check feature_indices. P3, P4 and P5 must have "
+                        "strides 8, 16 and 32 respectively."
+                    )
+
+                channels.append(int(feature.shape[1]))
 
             return channels
 
         finally:
             self.yolo_model.train(was_training)
 
-    def _freeze_yolo(self):
+    def _freeze_yolo(self) -> None:
         """Freeze YOLO parameters and BatchNorm running statistics."""
 
         for parameter in self.yolo_model.parameters():
@@ -341,10 +382,16 @@ class YoloBackbonePAFPN(nn.Module):
             [B, out_channels, H/8, W/8]
         """
 
+        if not isinstance(img, torch.Tensor):
+            raise TypeError("Input image must be a torch.Tensor.")
+
         if img.ndim != 4:
             raise ValueError(
                 f"Expected [B,3,H,W], got {tuple(img.shape)}."
             )
+
+        if img.shape[0] <= 0:
+            raise ValueError("Image batch cannot be empty.")
 
         if img.shape[1] != 3:
             raise ValueError("Input must have three RGB channels.")
@@ -352,9 +399,25 @@ class YoloBackbonePAFPN(nn.Module):
         if not img.is_floating_point():
             raise TypeError("Input image tensor must be floating point.")
 
-        if img.shape[-2] % 32 != 0 or img.shape[-1] % 32 != 0:
+        if not torch.isfinite(img).all().item():
+            raise ValueError("Input image contains NaN or infinite values.")
+
+        if (
+            img.shape[-2] <= 0
+            or img.shape[-1] <= 0
+            or img.shape[-2] % 32 != 0
+            or img.shape[-1] % 32 != 0
+        ):
             raise ValueError(
-                "Input height and width must be divisible by 32."
+                "Input height and width must be positive and divisible by 32."
+            )
+
+        backbone_parameter = next(self.yolo_model.parameters())
+
+        if img.device != backbone_parameter.device:
+            raise ValueError(
+                f"Input is on {img.device}, but YOLO backbone is on "
+                f"{backbone_parameter.device}."
             )
 
         p3, p4, p5 = self.extract_multiscale_features(img)
